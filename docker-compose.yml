@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  awx-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - awx-exporter:latest
+    image: awx-exporter:latest
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    env_file:
+      - .env
