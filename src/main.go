@@ -7,231 +7,268 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// --- Configuration ---
-type Config struct {
-	AWXURL             string
-	AWXUsername        string
-	AWXPassword        string
-	ScrapeInterval     time.Duration
-	ListenPort         string
-	InsecureSkipVerify bool
-	RequestTimeout     time.Duration
+var scrapeInterval int = 5 // Default scrape interval in minutes
+
+// AWX configuration from environment variables
+type AWXConfig struct {
+	Host        string
+	User        string
+	Password    string
+	UseHTTP     bool
+	TLSInsecure bool
 }
 
-// loadConfig loads configuration from environment variables.
-func loadConfig() (*Config, error) {
-	username := os.Getenv("AWX_USERNAME")
-	password := os.Getenv("AWX_PASSWORD")
-
-	if username == "" || password == "" {
-		return nil, fmt.Errorf("AWX_USERNAME and AWX_PASSWORD must be set")
-	}
-
-	scrapeIntervalStr := getEnv("SCRAPE_INTERVAL", "24h")
-	scrapeInterval, err := time.ParseDuration(scrapeIntervalStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid SCRAPE_INTERVAL duration: %w", err)
-	}
-
-	return &Config{
-		AWXURL:             getEnv("AWX_URL", "https://awx"),
-		AWXUsername:        username,
-		AWXPassword:        password,
-		ScrapeInterval:     scrapeInterval,
-		ListenPort:         ":" + getEnv("EXPORTER_PORT", "8080"),
-		InsecureSkipVerify: getEnv("INSECURE_SKIP_VERIFY", "false") == "true",
-		RequestTimeout:     30 * time.Second,
-	}, nil
+// JSON structures matching the AWX API response
+type HostResponse struct {
+	Count    int    `json:"count"`
+	Next     string `json:"next"`
+	Previous string `json:"previous"`
+	Results  []Host `json:"results"`
 }
 
-// --- Prometheus Metrics Definition ---
-const namespace = "awx"
+type Host struct {
+	ID                   int     `json:"id"`
+	Created              string  `json:"created"`
+	Modified             string  `json:"modified"`
+	Name                 string  `json:"name"`
+	Inventory            int     `json:"inventory"`
+	Enabled              bool    `json:"enabled"`
+	InstanceID           string  `json:"instance_id"`
+	HasActiveFailures    bool    `json:"has_active_failures"`
+	HasInventorySources  bool    `json:"has_inventory_sources"`
+	AnsibleFactsModified *string `json:"ansible_facts_modified"`
+	SummaryFields        struct {
+		Inventory struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"inventory"`
+		Groups struct {
+			Count   int `json:"count"`
+			Results []struct {
+				ID   int    `json:"id"`
+				Name string `json:"name"`
+			} `json:"results"`
+		} `json:"groups"`
+	} `json:"summary_fields"`
+}
 
+// Prometheus metrics
 var (
-	jobLastRunTimestamp = prometheus.NewGaugeVec(
+	hostInfo = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "job_last_run_timestamp_seconds",
-			Help:      "The finish time of the last job run for a template, as a Unix timestamp.",
+			Name: "awx_host_info",
+			Help: "Information about AWX hosts",
 		},
-		[]string{"job_template_id", "job_template_name"},
+		[]string{"id", "name", "inventory_id", "inventory_name", "enabled", "instance_id"},
 	)
-	inventoryFailedHosts = prometheus.NewGaugeVec(
+
+	hostStatus = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "template_inventory_failed_hosts",
-			Help:      "Number of hosts with active failures in the inventory associated with a job template.",
+			Name: "awx_host_status",
+			Help: "Status metrics for AWX hosts",
 		},
-		[]string{"job_template_id", "job_template_name"},
+		[]string{"id", "name", "metric"},
 	)
-	inventoryTotalHosts = prometheus.NewGaugeVec(
+
+	hostTimestamps = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "template_inventory_total_hosts",
-			Help:      "Number of active hosts in the inventory associated with a job template.",
+			Name: "awx_host_timestamps",
+			Help: "Timestamps for AWX host events",
 		},
-		[]string{"job_template_id", "job_template_name"},
+		[]string{"id", "name", "event"},
+	)
+
+	hostGroupMembership = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "awx_host_group_membership",
+			Help: "Host to group membership in AWX",
+		},
+		[]string{"host_id", "host_name", "group_id", "group_name"},
+	)
+
+	groupInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "awx_group_info",
+			Help: "Information about AWX groups",
+		},
+		[]string{"group_id", "group_name", "inventory_id"},
 	)
 )
 
-// --- Data Structures for AWX API JSON ---
-type JobTemplateResponse struct {
-	Next    string        `json:"next"`
-	Results []JobTemplate `json:"results"`
+func init() {
+	prometheus.MustRegister(hostInfo)
+	prometheus.MustRegister(hostStatus)
+	prometheus.MustRegister(hostTimestamps)
+	prometheus.MustRegister(hostGroupMembership)
+	prometheus.MustRegister(groupInfo)
 }
 
-type JobTemplate struct {
-	ID            int           `json:"id"`
-	Name          string        `json:"name"`
-	LastJobRun    string        `json:"last_job_run"`
-	SummaryFields SummaryFields `json:"summary_fields"`
+func main() {
+	config := loadConfig()
+	http.Handle("/metrics", promhttp.Handler())
+	go updateMetrics(config)
+	log.Printf("Starting AWX exporter on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-type SummaryFields struct {
-	Inventory struct {
-		HostsWithFailures int `json:"hosts_with_active_failures"`
-		TotalHosts        int `json:"total_hosts"`
-	} `json:"inventory"`
-}
-
-// Global HTTP client and configuration
-var (
-	httpClient *http.Client
-	appConfig  *Config
-)
-
-// --- Helper Functions ---
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
+func loadConfig() *AWXConfig {
+	config := &AWXConfig{
+		Host:        os.Getenv("AWX_HOST"),
+		User:        os.Getenv("AWX_USER"),
+		Password:    os.Getenv("AWX_PASSWORD"),
+		UseHTTP:     os.Getenv("HTTP") == "true",
+		TLSInsecure: os.Getenv("TLS_INSECURE") == "true",
 	}
-	return fallback
+
+	if config.Host == "" || config.User == "" || config.Password == "" {
+		log.Fatal("AWX_HOST, AWX_USER, and AWX_PASSWORD must be set")
+	}
+
+	return config
 }
 
-// --- Exporter Logic ---
-func scrapeAWX() {
-	log.Println("Starting scrape of AWX job templates...")
+func updateMetrics(config *AWXConfig) {
+	for {
+		if err := fetchAndUpdateMetrics(config); err != nil {
+			log.Printf("Error updating metrics: %v", err)
+		}
+		time.Sleep(time.Duration(scrapeInterval) * time.Minute)
+	}
+}
 
-	nextPagePath := "/api/v2/job_templates"
-	// Reset metrics at the start of a scrape to remove stale entries
-	jobLastRunTimestamp.Reset()
-	inventoryFailedHosts.Reset()
-	inventoryTotalHosts.Reset()
+func fetchAndUpdateMetrics(config *AWXConfig) error {
+	// Reset metrics before each update
+	hostInfo.Reset()
+	hostStatus.Reset()
+	hostTimestamps.Reset()
+	hostGroupMembership.Reset()
+	groupInfo.Reset()
 
-	// Use url.Parse to handle the base URL properly
-	base, err := url.Parse(appConfig.AWXURL)
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: config.TLSInsecure},
+		},
+	}
+
+	nextURL := buildURL(config, "/api/v2/hosts/?format=json")
+	for nextURL != "" {
+		resp, err := makeAWXRequest(client, config, nextURL)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Fetched data from %s\n", nextURL)
+		var hostResponse HostResponse
+		if err := json.Unmarshal(resp, &hostResponse); err != nil {
+			return fmt.Errorf("error parsing JSON: %w", err)
+		}
+		processHosts(hostResponse.Results)
+		nextURL = buildURL(config, hostResponse.Next)
+	}
+
+	return nil
+}
+
+func buildURL(config *AWXConfig, path string) string {
+	protocol := "https"
+	if config.UseHTTP {
+		protocol = "http"
+	}
+	return fmt.Sprintf("%s://%s%s", protocol, config.Host, path)
+}
+
+func makeAWXRequest(client *http.Client, config *AWXConfig, url string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		log.Printf("Error: Invalid AWX_URL: %v", err)
+		return nil, err
+	}
+
+	req.SetBasicAuth(config.User, config.Password)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status: %s", resp.Status)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+func processHosts(hosts []Host) {
+	for _, host := range hosts {
+		// Convert IDs to strings for labels
+		idStr := strconv.Itoa(host.ID)
+		invIDStr := strconv.Itoa(host.SummaryFields.Inventory.ID)
+		enabled := "false"
+		if host.Enabled {
+			enabled = "true"
+		}
+
+		// Host info metric
+		hostInfo.WithLabelValues(
+			idStr,
+			host.Name,
+			invIDStr,
+			host.SummaryFields.Inventory.Name,
+			enabled,
+			host.InstanceID,
+		).Set(1)
+
+		// Status metrics
+		hostStatus.WithLabelValues(idStr, host.Name, "active_failures").Set(boolToFloat(host.HasActiveFailures))
+		hostStatus.WithLabelValues(idStr, host.Name, "inventory_sources").Set(boolToFloat(host.HasInventorySources))
+
+		// Timestamps
+		setTimestampMetric(host.Created, idStr, host.Name, "created")
+		setTimestampMetric(host.Modified, idStr, host.Name, "modified")
+		if host.AnsibleFactsModified != nil {
+			setTimestampMetric(*host.AnsibleFactsModified, idStr, host.Name, "ansible_facts_modified")
+		}
+
+		// Group information
+		for _, group := range host.SummaryFields.Groups.Results {
+			groupIDStr := strconv.Itoa(group.ID)
+
+			// Record group membership
+			hostGroupMembership.WithLabelValues(
+				idStr,
+				host.Name,
+				groupIDStr,
+				group.Name,
+			).Set(1)
+
+			// Record group info (will deduplicate automatically)
+			groupInfo.WithLabelValues(
+				groupIDStr,
+				group.Name,
+				invIDStr,
+			).Set(1)
+		}
+	}
+}
+
+func boolToFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func setTimestampMetric(timestampStr, id, name, event string) {
+	timestamp, err := time.Parse(time.RFC3339, timestampStr)
+	if err != nil {
+		log.Printf("Error parsing timestamp %s for host %s: %v", timestampStr, name, err)
 		return
 	}
-
-	for nextPagePath != "" {
-		// Resolve the next page path relative to the base URL
-		reqURL := base.ResolveReference(&url.URL{Path: nextPagePath})
-
-		req, err := http.NewRequest("GET", reqURL.String(), nil)
-		if err != nil {
-			log.Printf("Failed to create request for %s: %v", reqURL, err)
-			break
-		}
-		req.SetBasicAuth(appConfig.AWXUsername, appConfig.AWXPassword)
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			log.Printf("Failed to execute request for %s: %v", reqURL, err)
-			break
-		}
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Received non-200 status code from %s: %d", reqURL, resp.StatusCode)
-			resp.Body.Close()
-			break
-		}
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Failed to read response body from %s: %v", reqURL, err)
-			resp.Body.Close()
-			break
-		}
-		resp.Body.Close()
-
-		var response JobTemplateResponse
-		if err := json.Unmarshal(body, &response); err != nil {
-			log.Printf("Failed to unmarshal JSON from %s: %v", reqURL, err)
-			break
-		}
-
-		for _, template := range response.Results {
-			labels := prometheus.Labels{
-				"job_template_id":   fmt.Sprintf("%d", template.ID),
-				"job_template_name": template.Name,
-			}
-
-			if template.LastJobRun != "" {
-				finishedTime, err := time.Parse(time.RFC3339, template.LastJobRun)
-				if err == nil {
-					jobLastRunTimestamp.With(labels).Set(float64(finishedTime.Unix()))
-				} else {
-					log.Printf("Could not parse timestamp '%s' for template '%s'", template.LastJobRun, template.Name)
-				}
-			}
-
-			failedHosts := template.SummaryFields.Inventory.HostsWithFailures
-			totalHosts := template.SummaryFields.Inventory.TotalHosts
-
-			inventoryFailedHosts.With(labels).Set(float64(failedHosts))
-			inventoryTotalHosts.With(labels).Set(float64(totalHosts))
-		}
-
-		nextPagePath = response.Next
-	}
-
-	log.Println("Scrape finished.")
-}
-
-// --- Main Execution ---
-func main() {
-	var err error
-	appConfig, err = loadConfig()
-	if err != nil {
-		log.Fatalf("Configuration error: %v", err)
-	}
-
-	// Initialize the global HTTP client
-	httpClient = &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: appConfig.InsecureSkipVerify},
-		},
-		Timeout: appConfig.RequestTimeout,
-	}
-
-	// Register metrics
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(jobLastRunTimestamp)
-	reg.MustRegister(inventoryFailedHosts)
-	reg.MustRegister(inventoryTotalHosts)
-
-	// Start the scraping loop in a background goroutine
-	go func() {
-		for {
-			scrapeAWX()
-			log.Printf("Sleeping for %v...", appConfig.ScrapeInterval)
-			time.Sleep(appConfig.ScrapeInterval)
-		}
-	}()
-
-	// Expose the registered metrics via HTTP
-	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-
-	log.Printf("Prometheus metrics server started on http://localhost%s", appConfig.ListenPort)
-	if err := http.ListenAndServe(appConfig.ListenPort, nil); err != nil {
-		log.Fatalf("Error starting HTTP server: %v", err)
-	}
+	hostTimestamps.WithLabelValues(id, name, event).Set(float64(timestamp.Unix()))
 }
