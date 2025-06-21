@@ -1,274 +1,148 @@
 package main
 
 import (
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-var scrapeInterval int = 5 // Default scrape interval in minutes
-
-// AWX configuration from environment variables
-type AWXConfig struct {
-	Host        string
-	User        string
-	Password    string
-	UseHTTP     bool
-	TLSInsecure bool
-}
-
-// JSON structures matching the AWX API response
-type HostResponse struct {
-	Count    int    `json:"count"`
-	Next     string `json:"next"`
-	Previous string `json:"previous"`
-	Results  []Host `json:"results"`
-}
-
-type Host struct {
-	ID                   int     `json:"id"`
-	Created              string  `json:"created"`
-	Modified             string  `json:"modified"`
-	Name                 string  `json:"name"`
-	Inventory            int     `json:"inventory"`
-	Enabled              bool    `json:"enabled"`
-	InstanceID           string  `json:"instance_id"`
-	HasActiveFailures    bool    `json:"has_active_failures"`
-	HasInventorySources  bool    `json:"has_inventory_sources"`
-	AnsibleFactsModified *string `json:"ansible_facts_modified"`
-	SummaryFields        struct {
-		Inventory struct {
-			ID   int    `json:"id"`
-			Name string `json:"name"`
-		} `json:"inventory"`
-		Groups struct {
-			Count   int `json:"count"`
-			Results []struct {
-				ID   int    `json:"id"`
-				Name string `json:"name"`
-			} `json:"results"`
-		} `json:"groups"`
-	} `json:"summary_fields"`
-}
-
-// Prometheus metrics
-var (
-	hostInfo = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "awx_host_info",
-			Help: "Information about AWX hosts",
-		},
-		[]string{"id", "name", "inventory_id", "inventory_name", "enabled", "instance_id"},
-	)
-
-	hostStatus = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "awx_host_status",
-			Help: "Status metrics for AWX hosts",
-		},
-		[]string{"id", "name", "metric"},
-	)
-
-	hostTimestamps = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "awx_host_timestamps",
-			Help: "Timestamps for AWX host events",
-		},
-		[]string{"id", "name", "event"},
-	)
-
-	hostGroupMembership = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "awx_host_group_membership",
-			Help: "Host to group membership in AWX",
-		},
-		[]string{"host_id", "host_name", "group_id", "group_name"},
-	)
-
-	groupInfo = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "awx_group_info",
-			Help: "Information about AWX groups",
-		},
-		[]string{"group_id", "group_name", "inventory_id"},
-	)
-)
-
-func init() {
-	prometheus.MustRegister(hostInfo)
-	prometheus.MustRegister(hostStatus)
-	prometheus.MustRegister(hostTimestamps)
-	prometheus.MustRegister(hostGroupMembership)
-	prometheus.MustRegister(groupInfo)
-}
-
 func main() {
+	// Setup structured logging
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	config := loadConfig()
-	http.Handle("/metrics", promhttp.Handler())
-	go updateMetrics(config)
-	log.Printf("Starting AWX exporter on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
+	scrapeInterval := getScrapeInterval()
+	port := getPort()
 
-func loadConfig() *AWXConfig {
-	config := &AWXConfig{
-		Host:        os.Getenv("AWX_HOST"),
-		User:        os.Getenv("AWX_USER"),
-		Password:    os.Getenv("AWX_PASSWORD"),
-		UseHTTP:     os.Getenv("HTTP") == "true",
-		TLSInsecure: os.Getenv("TLS_INSECURE") == "true",
+	log.Printf("Starting AWX exporter - Host: %s, Port: %s, Interval: %v", config.Host, port, scrapeInterval)
+
+	// Setup HTTP server
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/health", healthHandler)
+
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
-	if config.Host == "" || config.User == "" || config.Password == "" {
-		log.Fatal("AWX_HOST, AWX_USER, and AWX_PASSWORD must be set")
-	}
+	// Start metrics collection in background
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	return config
-}
+	go updateMetrics(ctx, config, scrapeInterval)
 
-func updateMetrics(config *AWXConfig) {
-	for {
-		if err := fetchAndUpdateMetrics(config); err != nil {
-			log.Printf("Error updating metrics: %v", err)
+	// Setup graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+
+		log.Println("Shutting down...")
+		cancel()
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Error during server shutdown: %v", err)
 		}
-		time.Sleep(time.Duration(scrapeInterval) * time.Minute)
+	}()
+
+	log.Printf("Server started on :%s", port)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server error: %v", err)
 	}
 }
 
-func fetchAndUpdateMetrics(config *AWXConfig) error {
-	// Reset metrics before each update
-	hostInfo.Reset()
-	hostStatus.Reset()
-	hostTimestamps.Reset()
-	hostGroupMembership.Reset()
-	groupInfo.Reset()
+// healthHandler provides a simple health check endpoint
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"healthy","timestamp":"%s","service":"awx-exporter"}`, time.Now().Format(time.RFC3339))
+}
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: config.TLSInsecure},
-		},
+// updateMetrics runs the metrics collection loop
+func updateMetrics(ctx context.Context, config *AWXConfig, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Run initial collection immediately
+	if err := fetchAndUpdateMetrics(config); err != nil {
+		log.Printf("Initial collection failed: %v", err)
+		RecordScrapeError()
 	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := fetchAndUpdateMetrics(config); err != nil {
+				log.Printf("Collection failed: %v", err)
+				RecordScrapeError()
+			}
+		}
+	}
+}
+
+// fetchAndUpdateMetrics fetches data from AWX API and updates metrics
+func fetchAndUpdateMetrics(config *AWXConfig) error {
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start)
+		scrapeDuration.Observe(duration.Seconds())
+		log.Printf("Metrics collection completed in %v", duration)
+	}()
+
+	// Reset metrics before each update
+	ResetAllMetrics()
+
+	client := createHTTPClient(config)
 
 	nextURL := buildURL(config, "/api/v2/hosts/?format=json")
+	pageCount := 0
+	totalHosts := 0
+
 	for nextURL != "" {
 		resp, err := makeAWXRequest(client, config, nextURL)
 		if err != nil {
-			return err
+			RecordScrapeError()
+			return fmt.Errorf("failed to fetch data from %s: %w", nextURL, err)
 		}
-		fmt.Printf("Fetched data from %s\n", nextURL)
+
+		pageCount++
 		var hostResponse HostResponse
 		if err := json.Unmarshal(resp, &hostResponse); err != nil {
-			return fmt.Errorf("error parsing JSON: %w", err)
+			RecordScrapeError()
+			// Log the first 200 characters of the response for debugging
+			responsePreview := string(resp)
+			if len(responsePreview) > 200 {
+				responsePreview = responsePreview[:200] + "..."
+			}
+			log.Printf("Response preview: %s", responsePreview)
+			return fmt.Errorf("error parsing JSON from %s: %w", nextURL, err)
 		}
+
+		hostCount := len(hostResponse.Results)
+		totalHosts += hostCount
+		log.Printf("Page %d: %d hosts", pageCount, hostCount)
+
 		processHosts(hostResponse.Results)
 		nextURL = buildURL(config, hostResponse.Next)
 	}
 
+	log.Printf("Completed: %d pages, %d total hosts", pageCount, totalHosts)
 	return nil
-}
-
-func buildURL(config *AWXConfig, path string) string {
-	protocol := "https"
-	if config.UseHTTP {
-		protocol = "http"
-	}
-	return fmt.Sprintf("%s://%s%s", protocol, config.Host, path)
-}
-
-func makeAWXRequest(client *http.Client, config *AWXConfig, url string) ([]byte, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.SetBasicAuth(config.User, config.Password)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status: %s", resp.Status)
-	}
-
-	return io.ReadAll(resp.Body)
-}
-
-func processHosts(hosts []Host) {
-	for _, host := range hosts {
-		// Convert IDs to strings for labels
-		idStr := strconv.Itoa(host.ID)
-		invIDStr := strconv.Itoa(host.SummaryFields.Inventory.ID)
-		enabled := "false"
-		if host.Enabled {
-			enabled = "true"
-		}
-
-		// Host info metric
-		hostInfo.WithLabelValues(
-			idStr,
-			host.Name,
-			invIDStr,
-			host.SummaryFields.Inventory.Name,
-			enabled,
-			host.InstanceID,
-		).Set(1)
-
-		// Status metrics
-		hostStatus.WithLabelValues(idStr, host.Name, "active_failures").Set(boolToFloat(host.HasActiveFailures))
-		hostStatus.WithLabelValues(idStr, host.Name, "inventory_sources").Set(boolToFloat(host.HasInventorySources))
-
-		// Timestamps
-		setTimestampMetric(host.Created, idStr, host.Name, "created")
-		setTimestampMetric(host.Modified, idStr, host.Name, "modified")
-		if host.AnsibleFactsModified != nil {
-			setTimestampMetric(*host.AnsibleFactsModified, idStr, host.Name, "ansible_facts_modified")
-		}
-
-		// Group information
-		for _, group := range host.SummaryFields.Groups.Results {
-			groupIDStr := strconv.Itoa(group.ID)
-
-			// Record group membership
-			hostGroupMembership.WithLabelValues(
-				idStr,
-				host.Name,
-				groupIDStr,
-				group.Name,
-			).Set(1)
-
-			// Record group info (will deduplicate automatically)
-			groupInfo.WithLabelValues(
-				groupIDStr,
-				group.Name,
-				invIDStr,
-			).Set(1)
-		}
-	}
-}
-
-func boolToFloat(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-func setTimestampMetric(timestampStr, id, name, event string) {
-	timestamp, err := time.Parse(time.RFC3339, timestampStr)
-	if err != nil {
-		log.Printf("Error parsing timestamp %s for host %s: %v", timestampStr, name, err)
-		return
-	}
-	hostTimestamps.WithLabelValues(id, name, event).Set(float64(timestamp.Unix()))
 }
