@@ -40,3 +40,6 @@ go.work
 
 # VSCode
 .vscode/
+
+
+**go.sum
